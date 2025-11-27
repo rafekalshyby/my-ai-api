@@ -1,137 +1,125 @@
-import tkinter as tk
-from tkinter import ttk
-import threading
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import os
 import requests
-import time
-import random
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-CORRECT_SUCCESS_PHRASE = "login success"   # ما يعرضه api.html عند النجاح
+app = FastAPI()
 
-class NetworkBruteForceTool(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("أداة اختبار تسجيل الدخول")
-        self.geometry("900x650")
-        self.configure(bg='#1a1a1a')
+# إعداد Firebase
+cred = credentials.Certificate("firebase-config.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-        self.is_running = False
-        self.session = requests.Session()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-        self.setup_ui()
+class Message(BaseModel):
+    text: str
+    user_id: str = None
 
-    def setup_ui(self):
-        settings_frame = tk.LabelFrame(self, text="الإعدادات", bg='#2a2a2a', fg='white', font=('Arial', 12, 'bold'))
-        settings_frame.pack(fill='x', padx=10, pady=10)
+class UserRegister(BaseModel):
+    email: str
+    password: str
+    name: str
 
-        fields = [
-            ("رابط الخدمة:", "service_url", "http://127.0.0.1:5000/api.html"),
-            ("البادئة:", "prefix", ""),
-            ("الطول الكلي:", "length", "6"),
-            ("عدد المحاولات:", "attempts", "500"),
-            ("التأخير (ms):", "delay", "200"),
-            ("المكونات:", "charset", "0123456789")
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+@app.post("/register")
+def register(user: UserRegister):
+    try:
+        # التحقق إذا الإيميل موجود مسبقاً
+        existing_user = db.collection('users').where('email', '==', user.email).get()
+        if len(existing_user) > 0:
+            raise HTTPException(status_code=400, detail="Email already exists")
+        
+        # إنشاء مستخدم جديد
+        user_ref = db.collection('users').document()
+        user_ref.set({
+            'email': user.email,
+            'password': user.password,
+            'name': user.name,
+            'created_at': firestore.SERVER_TIMESTAMP
+        })
+        
+        return {"message": "User created successfully", "user_id": user_ref.id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/login")
+def login(user: UserLogin):
+    try:
+        # البحث عن المستخدم
+        users_ref = db.collection('users')
+        query = users_ref.where('email', '==', user.email).where('password', '==', user.password)
+        results = query.get()
+        
+        if len(results) == 0:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        user_data = results[0].to_dict()
+        return {
+            "message": "Login successful", 
+            "user_id": results[0].id,
+            "user_name": user_data.get('name')
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/chat")
+def chat(msg: Message):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}"
+    }
+
+    payload = {
+        "model": "llama3-70b-8192",
+        "messages": [
+            {"role": "user", "content": msg.text}
         ]
+    }
 
-        for idx, (label, name, default) in enumerate(fields):
-            frame = tk.Frame(settings_frame, bg='#2a2a2a')
-            frame.grid(row=idx, column=0, sticky='ew', pady=3)
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        json=payload,
+        headers=headers
+    )
 
-            tk.Label(frame, text=label, bg='#2a2a2a', fg='white').pack(side='left')
-            entry = tk.Entry(frame, bg='#333', fg='white', insertbackground='white')
-            entry.insert(0, default)
-            entry.pack(side='left', fill='x', expand=True)
+    result = response.json()
+    ai_response = result["choices"][0]["message"]["content"]
+    
+    # حفظ المحادثة إذا كان هناك user_id
+    if msg.user_id:
+        chat_ref = db.collection('chats').document()
+        chat_ref.set({
+            'user_id': msg.user_id,
+            'message_text': msg.text,
+            'ai_response': ai_response,
+            'created_at': firestore.SERVER_TIMESTAMP
+        })
+    
+    return {"reply": ai_response}
 
-            setattr(self, f"{name}_entry", entry)
+@app.get("/user_chats/{user_id}")
+def get_user_chats(user_id: str):
+    try:
+        chats_ref = db.collection('chats')
+        query = chats_ref.where('user_id', '==', user_id).order_by('created_at')
+        results = query.get()
+        
+        chats = []
+        for doc in results:
+            chat_data = doc.to_dict()
+            chat_data['id'] = doc.id
+            chats.append(chat_data)
+            
+        return {"chats": chats}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-        control = tk.Frame(self, bg="#1a1a1a")
-        control.pack(pady=10)
-
-        self.start_btn = tk.Button(control, text="▶ بدء", command=self.start_attack,
-                                   bg="#28a745", fg="white", font=("Arial", 12), width=15)
-        self.start_btn.pack(side="left", padx=5)
-
-        self.stop_btn = tk.Button(control, text="⏹ إيقاف", state="disabled",
-                                  command=self.stop_attack, bg="#dc3545", fg="white",
-                                  font=("Arial", 12), width=10)
-        self.stop_btn.pack(side="left", padx=5)
-
-        results_frame = tk.LabelFrame(self, text="النتائج", bg='#2a2a2a', fg='white')
-        results_frame.pack(fill='both', expand=True, padx=10, pady=5)
-
-        self.log_text = tk.Text(results_frame, bg='#111', fg='white', font=('Consolas', 10))
-        self.log_text.pack(fill='both', expand=True)
-
-    def log(self, msg):
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-        self.update_idletasks()
-
-    def generate_code(self):
-        prefix = self.prefix_entry.get()
-        length = int(self.length_entry.get())
-        charset = self.charset_entry.get()
-
-        suffix_len = length - len(prefix)
-        suffix = ''.join(random.choice(charset) for _ in range(suffix_len))
-
-        return prefix + suffix
-
-    def start_attack(self):
-        self.is_running = True
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-
-        self.log("🔍 بدء التخمين...")
-
-        threading.Thread(target=self.attack, daemon=True).start()
-
-    def stop_attack(self):
-        self.is_running = False
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
-        self.log("⛔ تم الإيقاف.")
-
-    def check_success(self, response):
-        if not response:
-            return False
-
-        text = response.text.lower()
-
-        if CORRECT_SUCCESS_PHRASE in text:
-            return True
-
-        return False
-
-    def attack(self):
-        url = self.service_url_entry.get().strip()
-        delay = int(self.delay_entry.get()) / 1000
-        max_attempts = int(self.attempts_entry.get())
-
-        for _ in range(max_attempts):
-            if not self.is_running:
-                break
-
-            code = self.generate_code()
-
-            try:
-                # إرسال كلمة المرور فقط كما تطلب api.html
-                response = self.session.get(url, params={"password": code})
-
-                if self.check_success(response):
-                    self.log(f"\n✔✔✔ نجاح! كلمة المرور هي: {code}\n")
-                    self.stop_attack()
-                    return
-
-                self.log(f"✘ فشل: {code}")
-
-            except Exception as e:
-                self.log(f"⚠ خطأ اتصال: {str(e)}")
-
-            time.sleep(delay)
-
-        self.stop_attack()
-
-
-if __name__ == "__main__":
-    app = NetworkBruteForceTool()
-    app.mainloop()
+@app.get("/")
+def home():
+    return {"message": "AI Chat API is running!"}
